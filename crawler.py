@@ -38,21 +38,23 @@ async def wait_for_full_load(page, timeout=15000):
     except PWTimeout: pass
     await page.wait_for_timeout(250)
 
-async def crawl(start_url, mode, concurrency, Session):
-    # Create a crawl run record
+async def crawl(start_url: str, mode: str, concurrency: int, Session):
+    # 1) create a new crawl run
     async with Session() as session:
         run = CrawlRun(mode=mode, start_time=datetime.now(timezone.utc))
-        session.add(run); await session.commit()
+        session.add(run)
+        await session.commit()
         run_id = run.id
     print(f"ðŸš€ Starting crawl run {run_id} (mode={mode}) at {datetime.now(timezone.utc)} UTC")
 
     base_host = urlparse(start_url).netloc
 
-    # Seed/reset start URL
+    # 2) seed or reset the start URL
     async with Session() as session:
-        exists = await session.scalar(sa.select(URL).filter_by(url=start_url))
-        if exists:
-            exists.status = 'pending'; exists.last_attempt = None
+        existing = await session.scalar(sa.select(URL).filter_by(url=start_url))
+        if existing:
+            existing.status = 'pending'
+            existing.last_attempt = None
         else:
             session.add(URL(url=start_url, category='internal', status='pending'))
         await session.commit()
@@ -61,31 +63,34 @@ async def crawl(start_url, mode, concurrency, Session):
         browser = await pw.chromium.launch(headless=True)
         context = await browser.new_context(user_agent=USER_AGENTS[mode])
 
-        async def worker(idx):
+        from playwright._impl._errors import TargetClosedError
+
+        async def worker(idx: int):
             async with Session() as session:
                 while True:
-                    # Claim one pending URL
+                    # Claim one pending URL atomically
                     res = await session.execute(
                         sa.select(URL)
-                          .where(URL.status=='pending')
+                          .where(URL.status == 'pending')
                           .order_by(URL.id)
                           .with_for_update(skip_locked=True)
                           .limit(1)
                     )
                     url_obj = res.scalars().first()
                     if not url_obj:
-                        return
+                        return  # no more work
 
-                    # Classify
+                    # Classify and mark in_progress
                     parsed = urlparse(url_obj.url)
-                    url_obj.category = 'internal' if parsed.netloc==base_host else 'external'
+                    url_obj.category = 'internal' if parsed.netloc == base_host else 'external'
                     url_obj.status = 'in_progress'
                     url_obj.last_attempt = datetime.now(timezone.utc)
                     await session.commit()
 
                     print(f"[Worker {idx}] Crawling: {url_obj.url} ({url_obj.category})")
+
                     if url_obj.category == 'external':
-                        # HTTP status-only
+                        # Only fetch HTTP status
                         try:
                             resp = await context.request.get(url_obj.url, timeout=30000)
                             status = resp.status
@@ -104,35 +109,43 @@ async def crawl(start_url, mode, concurrency, Session):
                         session.add(snap)
                         url_obj.status = 'done'
                         await session.commit()
-                        print(f"[Worker {idx}] External status: {status}")
+                        print(f"[Worker {idx}] External URL status: {status}")
                         continue
 
-                    # Internal: full page + metrics + link graph
-                    page = await context.new_page()
+                    # Internal page: full rendering
+                    try:
+                        page = await context.new_page()
+                    except TargetClosedError:
+                        # Browser or context already closed; exit worker
+                        return
+
                     try:
                         resp = await page.goto(url_obj.url, timeout=30000, wait_until='domcontentloaded')
                         status_code = resp.status if resp else None
                         await wait_for_full_load(page)
 
-                        perf_json = await page.evaluate("() => JSON.stringify(window.performance.timing)")
-                        perf      = json.loads(perf_json)
-                        nav       = perf.get('navigationStart',0)
-                        ttfb      = perf.get('responseStart',0) - nav
-                        domc      = perf.get('domContentLoadedEventEnd',0) - nav
-                        loade     = perf.get('loadEventEnd',0) - nav
+                        # Performance metrics
+                        timing = await page.evaluate("() => JSON.stringify(window.performance.timing)")
+                        perf = json.loads(timing)
+                        nav = perf.get('navigationStart', 0)
+                        ttfb = perf.get('responseStart', 0) - nav
+                        domc = perf.get('domContentLoadedEventEnd', 0) - nav
+                        loade = perf.get('loadEventEnd', 0) - nav
 
-                        # Discover links
-                        hrefs = await page.eval_on_selector_all('a[href]', 'els=>els.map(e=>e.href)')
+                        # Discover outgoing links
+                        hrefs = await page.eval_on_selector_all('a[href]', 'els => els.map(e => e.href)')
                         new_links = []
                         for href in set(hrefs):
-                            if href == url_obj.url: continue
+                            if href == url_obj.url:
+                                continue
                             p = urlparse(href)
-                            if p.scheme in ('http','https'):
+                            if p.scheme in ('http', 'https'):
                                 target = await session.scalar(sa.select(URL).filter_by(url=href))
                                 if not target:
-                                    cat = 'internal' if p.netloc==base_host else 'external'
+                                    cat = 'internal' if p.netloc == base_host else 'external'
                                     new_url = URL(url=href, category=cat, status='pending')
-                                    session.add(new_url); await session.commit()
+                                    session.add(new_url)
+                                    await session.commit()
                                     tgt_id = new_url.id
                                 else:
                                     tgt_id = target.id
@@ -141,7 +154,7 @@ async def crawl(start_url, mode, concurrency, Session):
 
                         # Snapshot content
                         content = await page.content()
-                        digest  = hashlib.sha256(content.encode()).hexdigest()
+                        digest = hashlib.sha256(content.encode('utf-8')).hexdigest()
                         snap = Snapshot(
                             url_id=url_obj.id,
                             run_id=run_id,
@@ -154,9 +167,10 @@ async def crawl(start_url, mode, concurrency, Session):
                             load_event_end_ms=loade,
                             timestamp=datetime.now(timezone.utc)
                         )
-                        session.add(snap); await session.flush()
+                        session.add(snap)
+                        await session.flush()  # assign snap.id
 
-                        # Persist link edges
+                        # Persist link graph edges
                         for src, tgt in new_links:
                             session.add(Link(source_id=src, target_id=tgt, snapshot_id=snap.id))
 
@@ -165,7 +179,7 @@ async def crawl(start_url, mode, concurrency, Session):
 
                     except Exception as e:
                         await session.rollback()
-                        snap = Snapshot(
+                        error_snap = Snapshot(
                             url_id=url_obj.id,
                             run_id=run_id,
                             mode=mode,
@@ -173,26 +187,28 @@ async def crawl(start_url, mode, concurrency, Session):
                             error_message=str(e),
                             timestamp=datetime.now(timezone.utc)
                         )
-                        session.add(snap)
+                        session.add(error_snap)
                         url_obj.status = 'error'
                         await session.commit()
                         print(f"[Worker {idx}] Error on {url_obj.url}: {e}", file=sys.stderr)
                     finally:
                         await page.close()
 
+        # Launch and await workers, then close the browser
         tasks = [asyncio.create_task(worker(i)) for i in range(concurrency)]
-        await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks, return_exceptions=True)
         await browser.close()
 
-    # Finish run
+    # Mark crawl run end
     async with Session() as session:
         await session.execute(
             sa.update(CrawlRun)
-              .where(CrawlRun.id==run_id)
+              .where(CrawlRun.id == run_id)
               .values(end_time=datetime.now(timezone.utc))
         )
         await session.commit()
     print(f"ðŸ Finished crawl run {run_id} at {datetime.now(timezone.utc)} UTC")
+
 
 def get_database_url():
     url = os.getenv('DATABASE_URL')
