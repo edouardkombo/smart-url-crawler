@@ -1,19 +1,19 @@
-# SMART URL CRAWLER is a Playwright Link Crawler with MySQL, PageSpeed Metrics & Link Graph
+# SMART URL CRAWLER
 
 A robust, crash-resilient crawler that:
 
-- ðŸ” **Discovers** every **internal** link exactly once  
-- ðŸš« **Records** every **external** linkâ€™s HTTP status only  
-- ðŸŒ Supports **modes**: `desktop`, `mobile`, `bot` (`--mode`)  
-- ðŸ—„ï¸ Persists in MySQL:
+- Discovers every **internal** link exactly once  
+- Records every **external** link’s HTTP status only  
+- Supports modes: `desktop`, `mobile`, `bot` (`--mode`)  
+- Persists in MySQL:
   - **urls** (URL, category, status, last attempt)  
   - **crawl_runs** (mode, start/end timestamps)  
-  - **snapshots**  
+  - **snapshots**
     - **internal**: full HTML + SHA-256 hash + TTFB, DOMContentLoaded, LoadEventEnd  
     - **external**: HTTP status or error only  
-  - **links**: directed edges (source â†’ target) per snapshot  
-- ðŸ”„ Transactional frontier: `pending` â†’ `in_progress` â†’ `done`/`error`  
-- âš™ï¸ Configurable **concurrency** (`--concurrency`) & SPA-friendly wait logic  
+  - **links**: directed edges (source → target) per snapshot  
+- Transactional frontier: `pending` → `in_progress` → `done`/`error`  
+- Configurable concurrency (`--concurrency`) & SPA-friendly wait logic  
 
 ---
 
@@ -36,63 +36,63 @@ A robust, crash-resilient crawler that:
 
 ## Prerequisites
 
-- **Python** 3.9+  
-- **MySQL** 5.7+ (or compatible)  
-- **Playwright** for Python  
+- Python 3.9+  
+- MySQL 5.7+ (or compatible)  
+- Playwright for Python  
 
 Install dependencies:
 
-\`\`\`bash
+```bash
 pip install -r requirements.txt
 playwright install
-\`\`\`
+```
 
 ---
 
 ## Installation
 
-\`\`\`bash
-git clone https://your.repo/url-crawler.git
-cd url-crawler
+```bash
+git clone https://your.repo/smart-url-crawler.git
+cd smart-url-crawler
 pip install -r requirements.txt
 playwright install
 cp .env.example .env
-\`\`\`
+```
 
 ---
 
 ## Configuration
 
-Copy \`.env.example\` â†’ \`.env\` and fill in:
+Copy `.env.example` → `.env` and edit:
 
-\`\`\`dotenv
-# Either a full URL:
+```dotenv
+# DATABASE_URL or individual settings:
+
 # DATABASE_URL=mysql+asyncmy://user:pass@host:3306/url_crawler
 
-# Or individual:
 DB_USER=root
 DB_PASSWORD=secret
 DB_HOST=localhost
 DB_PORT=3306
 DB_NAME=url_crawler
-\`\`\`
+```
 
 ---
 
 ## Database Setup
 
-### Option A: ORM (\`db_manager.py\`)
+### Option A: ORM (db_manager.py)
 
-\`\`\`bash
-python db_manager.py drop   # âš ï¸ wipes all data
-python db_manager.py init   # creates tables via SQLAlchemy models
-\`\`\`
+```bash
+python db_manager.py drop
+python db_manager.py init
+```
 
-### Option B: Raw DDL (\`schema.sql\`)
+### Option B: Raw DDL (schema.sql)
 
-\`\`\`bash
+```bash
 mysql -u $DB_USER -p $DB_NAME < schema.sql
-\`\`\`
+```
 
 ---
 
@@ -100,116 +100,83 @@ mysql -u $DB_USER -p $DB_NAME < schema.sql
 
 Run the crawler:
 
-\`\`\`bash
-python crawler.py crawl <start_url> \
-  --mode <desktop|mobile|bot> \
-  --concurrency <N>
-\`\`\`
+```bash
+python crawler.py crawl <start_url> --mode desktop --concurrency 5
+```
 
-- \`<start_url>\`: e.g. \`https://example.com\`  
-- \`--mode\`: user-agent mode (default \`desktop\`)  
-- \`--concurrency\`: number of parallel workers (default 5)  
+- `<start_url>`: e.g. `https://example.com`  
+- `--mode`: `desktop`, `mobile`, or `bot` (default `desktop`)  
+- `--concurrency`: number of parallel workers (default 5)  
 
-**Example**:
+Example:
 
-\`\`\`bash
+```bash
 python crawler.py crawl https://example.com --mode mobile --concurrency 10
-\`\`\`
-
-**Sample Output**:
-
-\`\`\`
-ðŸš€ Starting crawl run 1 (mode=mobile) at 2025-07-02T12:00:00Z
-[Worker 0] Crawling: https://example.com (internal)
-[Worker 0] Detected 12 outgoing links
-[Worker 0] Saving snapshot for: https://example.com (status 200)
-[Worker 1] Crawling: https://external.com/page (external)
-[Worker 1] External URL status: 404
-...
-ðŸ Finished crawl run 1 at 2025-07-02T12:01:30Z
-\`\`\`
+```
 
 ---
 
 ## Inspecting Data
 
-Connect with your MySQL client and run:
-
-\`\`\`sql
--- 1. URL statuses
+```sql
+-- URL statuses
 SELECT status, COUNT(*) FROM urls GROUP BY status;
 
--- 2. Recent crawl runs
-SELECT id, mode, start_time, end_time
-FROM crawl_runs
-ORDER BY id DESC
-LIMIT 5;
+-- Recent crawl runs
+SELECT id, mode, start_time, end_time FROM crawl_runs ORDER BY id DESC LIMIT 5;
 
--- 3. Internal snapshots + metrics
-SELECT u.url,
-       s.status_code,
-       s.ttfb_ms,
-       s.dom_content_loaded_ms,
-       s.load_event_end_ms,
-       s.timestamp
-FROM snapshots s
-JOIN urls u ON u.id = s.url_id
+-- Internal snapshots + metrics
+SELECT u.url, s.status_code, s.ttfb_ms, s.dom_content_loaded_ms,
+       s.load_event_end_ms, s.timestamp
+FROM snapshots s JOIN urls u ON u.id = s.url_id
 WHERE u.category = 'internal'
-ORDER BY s.timestamp DESC
-LIMIT 10;
+ORDER BY s.timestamp DESC LIMIT 10;
 
--- 4. External statuses/errors
-SELECT u.url,
-       s.status_code,
-       s.error_message,
-       s.timestamp
-FROM snapshots s
-JOIN urls u ON u.id = s.url_id
+-- External statuses/errors
+SELECT u.url, s.status_code, s.error_message, s.timestamp
+FROM snapshots s JOIN urls u ON u.id = s.url_id
 WHERE u.category = 'external'
-ORDER BY s.timestamp DESC
-LIMIT 10;
+ORDER BY s.timestamp DESC LIMIT 10;
 
--- 5. Link graph: outgoing edges
-SELECT u1.url AS source,
-       u2.url AS target
+-- Link graph: outgoing edges
+SELECT u1.url AS source, u2.url AS target
 FROM links l
 JOIN urls u1 ON l.source_id = u1.id
 JOIN urls u2 ON l.target_id = u2.id
 ORDER BY u1.url;
-\`\`\`
+```
 
 ---
 
 ## Schema Overview
 
-See [schema.sql](schema.sql) for exact DDL. Key tables:
+See `schema.sql` for exact DDL. Key tables:
 
-- **urls**: URL records & statuses  
-- **crawl_runs**: run metadata  
-- **snapshots**: full internals or externals-only  
-- **links**: directed edges per snapshot  
+- **urls**  
+- **crawl_runs**  
+- **snapshots**  
+- **links**  
 
 ---
 
 ## Troubleshooting
 
-- **MissingGreenlet**: Ensure all AsyncSession calls are inside async functions driven by asyncio.run().  
-- **DB connection errors**: Verify `.env` variables.  
-- **Playwright issues**: Increase timeouts or add retries.  
+- **MissingGreenlet**: Ensure all async DB calls run inside `asyncio.run()`  
+- **DB errors**: Check `.env` for correct values  
+- **Playwright timeouts**: Increase or add retries  
 
 ---
 
 ## Extensions & Tuning
 
-- **Asset blocking**: Intercept images/fonts.  
-- **Retry logic**: Requeue errors with backoff.  
-- **Change detection**: Diff content_hash.  
-- **Visualization**: Use NetworkX or D3.js for link graph.  
-- **Docker**: Containerize for CI/CD.  
+- Asset blocking  
+- Retry logic  
+- Change detection  
+- Visualization  
+- Docker  
 
 ---
 
 ## License
 
 MIT
-
